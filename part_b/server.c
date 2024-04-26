@@ -4,45 +4,62 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
 
 #define PORT 8080
-#define MAX_CONNECTIONS 3
+#define MAX_CONNECTIONS 10 // Change this to limit different number of waiting connections in the queue
 #define MAX_BUFFER_SIZE 14
 
-int client_count = 0;
-
-void *handle_connection(void *);
+void handle_connection(int, int);
+void sigchld_handler(int);
 
 int main(int argc, char const *argv[])
 {
     int server_fd;
+
+    // Create a socket
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    // Set socket options to reuse address and port
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+
+    // Define server address
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
+    // Bind the socket to the address
     bind(server_fd, (struct sockaddr *)&address, sizeof(address));
+
+    // Listen for incoming connections (waiting connections may queue up to number of "MAX_CONNECTIONS")
+    // However, the limiting may not work as expected for some environments
     listen(server_fd, MAX_CONNECTIONS);
 
-    printf("Server has started\nWaiting for connections\n");
+    // Server setup message
+    printf("(parent) Server has started\n(parent) Waiting for connections\n");
+
+    // Install SIGCHLD handler
+    signal(SIGCHLD, sigchld_handler);
+
+    // Accept and handle incoming connections
+    int child_num = 0;
     while (1)
     {
-        if (client_count < MAX_CONNECTIONS)
+        int socket_id = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+        child_num++;
+        pid_t pid = fork();
+        if (pid == 0)
         {
-            int socket_id = accept(server_fd, (struct sockaddr *)&address, &addrlen);
-            pthread_t thread;
-            int ret = pthread_create(&thread, NULL, handle_connection, (void *)&socket_id);
-            ret = pthread_detach(thread);
-            client_count++;
+            handle_connection(socket_id, child_num);
+            exit(0);
         }
         else
         {
-            int socket_id = accept(server_fd, (struct sockaddr *)&address, &addrlen);
             close(socket_id);
         }
     }
@@ -50,32 +67,49 @@ int main(int argc, char const *argv[])
     exit(0);
 }
 
-void *handle_connection(void *socket_id_ptr)
+// Function to handle each connection
+void handle_connection(int socket_id, int child_num)
 {
-    int socket_id = *((int *)socket_id_ptr);
-    char buffer[MAX_BUFFER_SIZE];
+    char buffer[MAX_BUFFER_SIZE]; // Buffer to store incoming data
+
+    // Read data from the client (first message is client id)
     ssize_t byte_length = read(socket_id, buffer, MAX_BUFFER_SIZE);
+
+    buffer[byte_length] = '\0';                 // Cut the incoming data from its end to prevent issues due to overriding old messages
+    send(socket_id, buffer, strlen(buffer), 0); // Echo client_id to the client back to let it know the server will start serving him / connection established
     int client_id = atoi(buffer);
-    printf("Incoming request from client #%d\n", client_id);
+    printf("(child #%d) Connection established with client #%d\n", child_num, client_id);
 
     buffer[0] = 'E';
-    while (buffer[0] != '-')
+    while (buffer[0] != '-') // As long as connection is not terminated by the client
     {
-        byte_length = read(socket_id, buffer, MAX_BUFFER_SIZE);
-        buffer[byte_length] = '\0';
-        printf("(client #%d) Request=%s", client_id, buffer);
-        if (buffer[0] == '-')
+        byte_length = read(socket_id, buffer, MAX_BUFFER_SIZE); // Read incoming message
+        buffer[byte_length] = '\0';                             // Cut the incoming data from its end to prevent issues due to overriding old messages
+
+        printf("(child #%d for client #%d) Request=%s", child_num, client_id, buffer);
+        if (buffer[0] == '-') // If the connection is terminated by the client
         {
             printf(" dropping connection\n");
             close(socket_id);
-            client_count--;
             break;
         }
         printf("\n");
 
         int val = atoi(buffer);
+
+        // Prepare response
         char response[MAX_BUFFER_SIZE];
         sprintf(response, "%d", val * val);
+
+        // Send response to the client
         send(socket_id, response, strlen(response), 0);
     }
+}
+
+// Signal handler for SIGCHLD
+void sigchld_handler(int signo)
+{
+    // Reap all child processes to prevent them from becoming zombies
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
 }
